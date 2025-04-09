@@ -1,31 +1,25 @@
 // Import required dependencies
 const fs = require('fs').promises;
 const path = require('path');
-const { QdrantClient } = require('@qdrant/js-client');
-const { pipeline } = require('@xenova/transformers');
 const PDFParser = require('pdf-parse');
 const mammoth = require('mammoth');
+const vectorDB = require('./vector-db');
 require('dotenv').config();
 
 // Configure logging
 function log(level, ...args) {
   const timestamp = new Date().toISOString();
-  console[level](`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  console[level](`[${timestamp}] [${level.toUpperCase()}] [Indexer]`, ...args);
 }
-
-// Initialize Qdrant client
-const qdrant = new QdrantClient({
-  url: process.env.QDRANT_URL || 'http://localhost:6333',
-});
 
 // Configuration
 const config = {
   documentsDir: process.env.DOCUMENTS_DIR || './documents',
   chunkSize: parseInt(process.env.CHUNK_SIZE || '500'),
   chunkOverlap: parseInt(process.env.CHUNK_OVERLAP || '50'),
-  collectionName: process.env.QDRANT_COLLECTION || 'knowledge-collection',
-  embeddingModel: process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2',
-  dimensions: 384  // Dimensionen für das Standard-Modell 'all-MiniLM-L6-v2'
+  resetCollection: process.env.RESET_COLLECTION === 'true', // true = Vollständige Neuindexierung
+  skipExisting: process.env.SKIP_EXISTING === 'true', // true = Vorhandene Dokumente überspringen
+  supportedExtensions: ['.pdf', '.docx', '.txt', '.md', '.html']
 };
 
 // Hauptfunktion
@@ -37,12 +31,18 @@ async function main() {
     // Erstelle Verzeichnis, falls es nicht existiert
     await ensureDirectoryExists(config.documentsDir);
     
-    // Erstelle Qdrant-Collection, falls sie nicht existiert
-    await ensureCollectionExists();
+    // Initialisiere Vector DB
+    await vectorDB.initialize();
     
-    // Lade den Embedding-Pipeline
-    log('info', `Lade Embedding-Modell: ${config.embeddingModel}`);
-    const embedder = await pipeline('feature-extraction', config.embeddingModel);
+    // Collection zurücksetzen, falls gewünscht
+    if (config.resetCollection) {
+      log('info', 'Setze Collection zurück für komplette Neuindexierung...');
+      await vectorDB.resetCollection();
+    }
+    
+    // Statistiken abrufen
+    const stats = await vectorDB.getStats();
+    log('info', `Aktuelle Vektordatenbank-Statistiken: ${stats.count} Dokumente, ${stats.model} Modell`);
     
     // Lese und verarbeite alle Dokumente
     const documents = await readAllDocuments();
@@ -54,6 +54,10 @@ async function main() {
       return;
     }
     
+    let indexedCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+    
     // Verarbeite und indexiere jedes Dokument
     for (const doc of documents) {
       log('info', `Verarbeite Dokument: ${doc.filename}`);
@@ -64,6 +68,7 @@ async function main() {
         
         if (!text || text.length === 0) {
           log('warn', `Kein Text aus Dokument extrahiert: ${doc.filename}`);
+          errorCount++;
           continue;
         }
         
@@ -73,18 +78,44 @@ async function main() {
         const chunks = createOptimizedChunks(text);
         log('info', `Text in ${chunks.length} Chunks aufgeteilt`);
         
-        // Erstelle Embeddings und speichere sie in Qdrant
-        await processAndStoreChunks(chunks, doc, embedder);
+        // Erstelle Dokumente für Vektordatenbank
+        const vectorDocuments = chunks.map((chunk, index) => ({
+          content: chunk,
+          metadata: {
+            documentName: doc.filename,
+            pageNumber: estimatePageNumber(index, chunks.length, doc.extension === '.pdf'),
+            path: doc.path
+          }
+        }));
         
-        log('info', `Dokument erfolgreich indexiert: ${doc.filename}`);
+        // Speichere Chunks in der Vektordatenbank
+        const result = await vectorDB.storeDocuments(vectorDocuments);
+        
+        if (result.success) {
+          log('info', `Dokument erfolgreich indexiert: ${doc.filename}`);
+          indexedCount++;
+        } else {
+          log('error', `Fehler beim Indexieren von Dokument ${doc.filename}: ${result.message}`);
+          errorCount++;
+        }
       } catch (docError) {
         log('error', `Fehler beim Verarbeiten von Dokument ${doc.filename}:`, docError);
+        errorCount++;
       }
     }
     
-    log('info', 'Dokument-Indexierung erfolgreich abgeschlossen');
+    // Abschließende Statistiken anzeigen
+    log('info', 'Dokument-Indexierung abgeschlossen:');
+    log('info', `- ${indexedCount} Dokumente erfolgreich indexiert`);
+    log('info', `- ${skippedCount} Dokumente übersprungen`);
+    log('info', `- ${errorCount} Dokumente mit Fehlern`);
+    
+    // Aktuelle Statistiken abrufen
+    const finalStats = await vectorDB.getStats();
+    log('info', `Vektordatenbank enthält jetzt insgesamt ${finalStats.count} Dokumente`);
   } catch (error) {
     log('error', 'Fehler bei der Dokument-Indexierung:', error);
+    process.exit(1);
   }
 }
 
@@ -95,43 +126,6 @@ async function ensureDirectoryExists(directory) {
   } catch {
     log('info', `Erstelle Verzeichnis: ${directory}`);
     await fs.mkdir(directory, { recursive: true });
-  }
-}
-
-// Stelle sicher, dass die Qdrant-Collection existiert
-async function ensureCollectionExists() {
-  try {
-    const collections = await qdrant.getCollections();
-    const collectionExists = collections.collections.some(c => c.name === config.collectionName);
-    
-    if (!collectionExists) {
-      log('info', `Erstelle neue Collection: ${config.collectionName}`);
-      
-      await qdrant.createCollection(config.collectionName, {
-        vectors: {
-          size: config.dimensions,
-          distance: 'Cosine'
-        },
-        optimizers_config: {
-          default_segment_number: 2
-        },
-        replication_factor: 1
-      });
-      
-      // Erstelle Index für Textsuche
-      await qdrant.createPayloadIndex(config.collectionName, {
-        field_name: 'content',
-        field_schema: 'text',
-        index_name: 'content_text_index'
-      });
-      
-      log('info', `Collection ${config.collectionName} erfolgreich erstellt`);
-    } else {
-      log('info', `Collection ${config.collectionName} existiert bereits`);
-    }
-  } catch (error) {
-    log('error', 'Fehler beim Prüfen/Erstellen der Collection:', error);
-    throw error;
   }
 }
 
@@ -150,12 +144,13 @@ async function readAllDocuments() {
         const extension = path.extname(file).toLowerCase();
         
         // Unterstützte Dateitypen
-        if (['.pdf', '.docx', '.txt', '.md', '.html'].includes(extension)) {
+        if (config.supportedExtensions.includes(extension)) {
           documents.push({
             filename: file,
             path: filePath,
             extension,
-            size: stats.size
+            size: stats.size,
+            lastModified: stats.mtime
           });
         }
       }
@@ -201,6 +196,9 @@ function createOptimizedChunks(text) {
   const chunkSize = config.chunkSize;
   const chunkOverlap = config.chunkOverlap;
   
+  // Bereinige den Text (entferne mehrfache Leerzeichen, Umbrüche usw.)
+  text = text.replace(/\s+/g, ' ').trim();
+  
   // Chunks an Satzgrenzen teilen, nicht mitten im Satz
   const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
   
@@ -235,59 +233,6 @@ function createOptimizedChunks(text) {
   return chunks;
 }
 
-// Verarbeite und speichere Chunks in Qdrant
-async function processAndStoreChunks(chunks, doc, embedder) {
-  try {
-    const points = [];
-    let chunkId = 0;
-    
-    for (const chunk of chunks) {
-      // Embedding erstellen
-      const embedding = await createEmbedding(chunk, embedder);
-      
-      // Punkt für Qdrant erstellen
-      points.push({
-        id: `${Date.now()}_${doc.filename}_${chunkId}`,
-        vector: embedding,
-        payload: {
-          content: chunk,
-          documentName: doc.filename,
-          pageNumber: estimatePageNumber(chunkId, chunks.length, doc.extension === '.pdf'),
-          chunkId: chunkId,
-          path: doc.path
-        }
-      });
-      
-      chunkId++;
-    }
-    
-    // In Batches von maximal 100 Punkten speichern
-    const batchSize = 100;
-    for (let i = 0; i < points.length; i += batchSize) {
-      const batch = points.slice(i, i + batchSize);
-      await qdrant.upsert(config.collectionName, {
-        points: batch
-      });
-      log('info', `Batch von ${batch.length} Chunks gespeichert (${i+1}-${Math.min(i+batchSize, points.length)} von ${points.length})`);
-    }
-  } catch (error) {
-    log('error', 'Fehler beim Verarbeiten und Speichern der Chunks:', error);
-    throw error;
-  }
-}
-
-// Erstelle Embedding für einen Text
-async function createEmbedding(text, embedder) {
-  try {
-    const output = await embedder(text, { pooling: 'mean', normalize: true });
-    const embedding = Array.from(output.data);
-    return embedding;
-  } catch (error) {
-    log('error', 'Fehler beim Erstellen des Embeddings:', error);
-    throw error;
-  }
-}
-
 // Schätze Seitennummer basierend auf Position im Dokument
 function estimatePageNumber(chunkId, totalChunks, isPdf) {
   if (isPdf) {
@@ -301,8 +246,17 @@ function estimatePageNumber(chunkId, totalChunks, isPdf) {
   }
 }
 
-// Starte das Hauptprogramm
-main().catch(error => {
-  log('error', 'Unbehandelter Fehler:', error);
-  process.exit(1);
-});
+// Starte das Hauptprogramm, wenn direkt ausgeführt
+if (require.main === module) {
+  main().catch(error => {
+    log('error', 'Unbehandelter Fehler:', error);
+    process.exit(1);
+  });
+}
+
+// Exportiere Funktionen für Tests und externe Verwendung
+module.exports = {
+  indexDocuments: main,
+  createOptimizedChunks,
+  extractTextFromDocument
+};
