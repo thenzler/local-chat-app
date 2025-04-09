@@ -2,12 +2,12 @@
 const express = require('express');
 const cors = require('cors');
 const { Ollama } = require('node-ollama');
-const { QdrantClient } = require('@qdrant/js-client');
 const fs = require('fs').promises;
 const path = require('path');
 require('dotenv').config();
 
-// Import routes
+// Import modules
+const vectorDB = require('./vector-db');
 const modelRoutes = require('./routes/models');
 
 // Initialize Express app
@@ -46,9 +46,9 @@ const ollama = new Ollama({
   host: process.env.OLLAMA_HOST || 'http://localhost:11434'
 });
 
-// Initialize Qdrant client
-const qdrant = new QdrantClient({
-  url: process.env.QDRANT_URL || 'http://localhost:6333',
+// Initialize VectorDB
+vectorDB.initialize().catch(err => {
+  log('error', 'Fehler bei der Initialisierung der VectorDB:', err);
 });
 
 // System prompt for the LLM
@@ -190,43 +190,28 @@ function extractSourcesFromText(text) {
 }
 
 /**
- * Relevante Dokumente aus der Vektordatenbank abrufen
+ * Relevante Dokumente aus der Vektordatenbank abrufen (verbesserte Version mit VectorDB)
  */
 async function retrieveRelevantDocuments(query) {
   log('debug', `Suche nach relevanten Dokumenten für: "${query}" in Vektordatenbank`);
   
   try {
-    const collectionName = process.env.QDRANT_COLLECTION || 'knowledge-collection';
+    // Prüfen, ob die VectorDB initialisiert ist
+    const stats = await vectorDB.getStats();
     
-    // Prüfen, ob die Sammlung existiert
-    try {
-      const collections = await qdrant.getCollections();
-      const collectionExists = collections.collections.some(c => c.name === collectionName);
-      
-      if (!collectionExists) {
-        log('warn', `Sammlung ${collectionName} existiert nicht. Bitte zuerst Dokumente indexieren.`);
-        return { contextText: "", documents: [] };
-      }
-    } catch (collectionError) {
-      log('error', 'Fehler beim Prüfen der Sammlung:', collectionError);
-      throw collectionError;
+    if (!stats.exists || stats.count === 0) {
+      log('warn', 'Vektordatenbank ist leer oder existiert nicht. Bitte zuerst Dokumente indexieren.');
+      return { contextText: "", documents: [] };
     }
     
-    // Da wir kein integriertes Embedding-Modell haben, verwenden wir hier zum Testen
-    // eine Schlüsselwortsuche. In der Produktion sollte hier ein richtiges Embedding erfolgen.
-    const searchResults = await qdrant.search(collectionName, {
-      // In einer realen Implementierung würde hier ein vector: [...] statt filter stehen
-      filter: {
-        must: [
-          {
-            should: query.split(/\s+/).map(word => ({
-              key: 'content',
-              match: { text: word }
-            }))
-          }
-        ]
-      },
-      limit: 10
+    // Semantische Suche verwenden, wenn aktiviert
+    const useSemanticSearch = process.env.USE_SEMANTIC_SEARCH !== 'false';
+    
+    // Suche mit der verbesserten VectorDB ausführen
+    const searchResults = await vectorDB.search(query, {
+      limit: 10,
+      minScore: 0.2,
+      useSemanticSearch: useSemanticSearch
     });
     
     // Ergebnisse verarbeiten
@@ -235,16 +220,16 @@ async function retrieveRelevantDocuments(query) {
     let totalTokenCount = 0;
     const MAX_TOKEN_ESTIMATE = 10000;
     
-    if (!searchResults || searchResults.length === 0) {
+    if (searchResults.count === 0) {
       log('info', 'Keine relevanten Dokumente in der Vektordatenbank gefunden');
       return { contextText: "", documents: [] };
     }
     
     // Jeden gefundenen Treffer verarbeiten
-    for (const result of searchResults) {
-      const content = result.payload.content || "";
-      const documentName = result.payload.documentName || "Unbekanntes Dokument";
-      const pageNumber = result.payload.pageNumber || 1;
+    for (const result of searchResults.results) {
+      const content = result.content || "";
+      const documentName = result.documentName || "Unbekanntes Dokument";
+      const pageNumber = result.pageNumber || 1;
       
       // Token-Größe schätzen - ungefähr 4 Zeichen pro Token als grobe Schätzung
       const estimatedTokens = Math.ceil(content.length / 4);
@@ -266,24 +251,26 @@ async function retrieveRelevantDocuments(query) {
       const doc = {
         content: processedContent,
         documentName,
-        pageNumber
+        pageNumber,
+        score: result.score
       };
       
       contextText += `Dokument: ${doc.documentName}\n`;
       contextText += `Seite: ${doc.pageNumber}\n`;
+      contextText += `Relevanz: ${Math.round(doc.score * 100)}%\n`;
       contextText += `Inhalt: ${doc.content}\n\n`;
       
       totalTokenCount += estimatedTokens;
       results.push(doc);
     }
     
-    log('info', `${results.length} relevante Dokumentenabschnitte mit lokaler Suche gefunden`);
+    log('info', `${results.length} relevante Dokumentenabschnitte mit ${useSemanticSearch ? 'semantischer' : 'keyword-basierter'} Suche gefunden`);
     log('debug', `Geschätzte Token-Anzahl: ${totalTokenCount}`);
     
     return { contextText, documents: results };
     
   } catch (error) {
-    log('error', 'Fehler bei der lokalen Dokumentensuche:', error);
+    log('error', 'Fehler bei der Dokumentensuche:', error);
     return { contextText: "", documents: [] };
   }
 }
@@ -292,15 +279,25 @@ async function retrieveRelevantDocuments(query) {
 app.get('/api/test-search', async (req, res) => {
   try {
     const query = req.query.q || 'test query';
-    const { documents } = await retrieveRelevantDocuments(query);
+    const useSemanticSearch = req.query.semantic !== 'false';
+    
+    log('info', `Test-Suche: "${query}" (Semantisch: ${useSemanticSearch ? 'ja' : 'nein'})`);
+    
+    // VectorDB für die Suche verwenden
+    const searchResults = await vectorDB.search(query, {
+      limit: 5,
+      useSemanticSearch: useSemanticSearch
+    });
     
     return res.json({
       query,
-      documentCount: documents.length,
-      documents: documents.map(d => ({
-        name: d.documentName,
-        page: d.pageNumber,
-        preview: d.content.substring(0, 200) + '...'
+      useSemanticSearch,
+      documentCount: searchResults.count,
+      documents: searchResults.results.map(doc => ({
+        name: doc.documentName,
+        page: doc.pageNumber,
+        score: doc.score,
+        preview: doc.content.substring(0, 200) + '...'
       }))
     });
   } catch (error) {
@@ -332,23 +329,20 @@ app.get('/api/check-ollama', async (req, res) => {
   }
 });
 
-// Check if Qdrant is running
-app.get('/api/check-qdrant', async (req, res) => {
+// Check if Vector DB is running and get statistics
+app.get('/api/check-vectordb', async (req, res) => {
   try {
-    const collections = await qdrant.getCollections();
-    const collectionName = process.env.QDRANT_COLLECTION || 'knowledge-collection';
-    const collectionExists = collections.collections.some(c => c.name === collectionName);
+    const stats = await vectorDB.getStats();
     
     return res.json({
-      status: 'ok',
-      collections: collections.collections.map(c => c.name),
-      currentCollection: collectionName,
-      collectionExists
+      status: stats.exists ? 'ok' : 'warning',
+      message: stats.exists ? `Vektordatenbank bereit mit ${stats.count} indizierten Dokumenten` : 'Vektordatenbank ist leer oder existiert nicht',
+      ...stats
     });
   } catch (error) {
     return res.status(500).json({
       status: 'error',
-      message: 'Qdrant ist nicht erreichbar. Bitte stellen Sie sicher, dass Qdrant läuft.',
+      message: 'Vektordatenbank ist nicht erreichbar',
       details: error.message
     });
   }
@@ -361,6 +355,6 @@ app.listen(PORT, () => {
   console.log(`Verwendetes lokales Modell: ${process.env.OLLAMA_MODEL || 'mistral'}`);
   console.log(`Gesundheitscheck verfügbar unter http://localhost:${PORT}/health`);
   console.log(`Suchtest verfügbar unter http://localhost:${PORT}/api/test-search?q=ihre+suchanfrage`);
-  console.log(`Ollama-Statusprüfung verfügbar unter http://localhost:${PORT}/api/check-ollama`);
-  console.log(`Qdrant-Statusprüfung verfügbar unter http://localhost:${PORT}/api/check-qdrant`);
+  console.log(`Modellprüfung verfügbar unter http://localhost:${PORT}/api/check-ollama`);
+  console.log(`Vektordatenbank-Status verfügbar unter http://localhost:${PORT}/api/check-vectordb`);
 });
